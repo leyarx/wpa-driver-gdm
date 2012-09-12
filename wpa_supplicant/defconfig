@@ -120,6 +120,9 @@ CONFIG_DRIVER_WIRED=y
 # Driver interface for the Broadcom RoboSwitch family
 #CONFIG_DRIVER_ROBOSWITCH=y
 
+# Driver interface for gdm72xx WiMAX kernel driver
+CONFIG_DRIVER_GDM=y
+
 # Driver interface for no driver (e.g., WPS ER only)
 #CONFIG_DRIVER_NONE=y
 

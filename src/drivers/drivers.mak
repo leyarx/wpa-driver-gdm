@@ -149,6 +149,11 @@ DRV_WPA_CFLAGS += -DCONFIG_DRIVER_ROBOSWITCH
 DRV_WPA_OBJS += ../src/drivers/driver_roboswitch.o
 endif
 
+ifdef CONFIG_DRIVER_GDM
+DRV_CFLAGS += -DCONFIG_DRIVER_GDM
+DRV_OBJS += ../src/drivers/driver_gdm.o
+endif
+
 ifdef CONFIG_WIRELESS_EXTENSION
 DRV_WPA_CFLAGS += -DCONFIG_WIRELESS_EXTENSION
 DRV_WPA_OBJS += ../src/drivers/driver_wext.o
