@@ -16,22 +16,31 @@
 
 #define NETLINK_WIMAX	31
 
-				#define WLAN_EID_VENDOR_SPECIFIC   221	
-				#define WPA_IE_VENDOR_TYPE 0x0050f201
-				#define WPA_VERSION   1	
+struct gdm_subscription_list {
+	u8 		name[32];
+	size_t 	name_len;
+	u8 		nspid[3];
+	u8 		nsp_name[32];
+	size_t 	nsp_name_len;
+};
 				
 struct wpa_driver_gdm_data {
 	void 	*ctx;
 	char 	ifname[IFNAMSIZ + 1];
 	int     ifindex;
 	int		netlink_sock;
+	int		ioctl_sock;
 #define MAX_SCAN_RESULTS 30
 	struct 	wpa_scan_res *scanres[MAX_SCAN_RESULTS];
 	size_t 	num_scanres;
-	u8 own_addr[ETH_ALEN];
+	u8 mac_addr[ETH_ALEN];
+#define MAX_SUBSCRIPTIONS 255	
+	struct gdm_subscription_list *ss_list[MAX_SUBSCRIPTIONS];
+	size_t	ss_list_len;
 	
 	u8 bssid[ETH_ALEN];
 	u8 ssid[32];
+	size_t ssid_len;
 };
 
 struct gdm_msghdr{
@@ -49,7 +58,6 @@ static int wpa_driver_gdm_get_bssid(void *priv, u8 *bssid)
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
 
-	//os_memset(bssid, 1, ETH_ALEN);
 	os_memcpy(bssid, drv->bssid, ETH_ALEN);
 	
 	return 0;
@@ -61,36 +69,24 @@ static int wpa_driver_gdm_get_ssid(void *priv, u8 *ssid)
 	
 	wpa_printf(MSG_INFO, "GDM [%s]", __FUNCTION__);
 	
-	//ssid = (u8 *) os_strdup("FRESHTEL_Ukraine");
-	os_memcpy(ssid, drv->ssid, 16);
-	return 16;
-}
-
-static int wpa_driver_gdm_set_key(const char *ifname, void *priv,
-				   enum wpa_alg alg, const u8 *addr,
-				   int key_idx, int set_tx,
-				   const u8 *seq, size_t seq_len,
-				   const u8 *key, size_t key_len)
-{
-	wpa_printf(MSG_DEBUG, "GDM [%s]: ifname=%s priv=%p alg=%d key_idx=%d "
-		   "set_tx=%d",
-		   __func__, ifname, priv, alg, key_idx, set_tx);
-	if (addr)
-		wpa_printf(MSG_DEBUG, "   addr=" MACSTR, MAC2STR(addr));
-	if (seq)
-		wpa_hexdump(MSG_DEBUG, "   seq", seq, seq_len);
-	if (key)
-		wpa_hexdump_key(MSG_DEBUG, "   key", key, key_len);
-	return 0;
+	os_memcpy(ssid, drv->ssid, drv->ssid_len);
+	return drv->ssid_len;
 }
 
 static const u8 * wpa_driver_gdm_get_mac_addr(void *priv)
 {
 	struct wpa_driver_gdm_data *drv = priv;
+	struct ifreq ifr;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __func__);
 	
-	return drv->own_addr;
+	ifr.ifr_addr.sa_family = AF_INET;
+	os_strncpy(ifr.ifr_name, drv->ifname, IFNAMSIZ-1);
+	ioctl(drv->ioctl_sock, SIOCGIFHWADDR, &ifr);
+	
+	os_memcpy(drv->mac_addr, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	
+	return drv->mac_addr;
 }
 
 static int wpa_driver_gdm_send_eapol(void *priv, const u8 *dest, u16 proto,
@@ -118,9 +114,6 @@ static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 typ
 	struct gdm_nlmsghdr{
 		le32	ifindex;
 		struct 	gdm_msghdr msg;
-//		be16 	type;
-//		be16 	length;
-//		u8 		data[0];
 	} STRUCT_PACKED;
 	
 	struct gdm_nlmsghdr *hdr;	
@@ -213,7 +206,7 @@ static void wpa_driver_gdm_scanresp(struct wpa_driver_gdm_data *drv,
 	size_t ssid_len;
 	size_t extra_len = 0;
 	u8 *pos;
-	int i, length;
+	int i;
 	
 	for (i=0; i < len;)
 	{
@@ -235,7 +228,6 @@ static void wpa_driver_gdm_scanresp(struct wpa_driver_gdm_data *drv,
 					drv->scanres[drv->num_scanres++] = res;
 					res = NULL;
 				}
-				//extra_len += 8;
 				res = os_zalloc(sizeof(*res)+extra_len);// + MAX_IE_LEN
 				if (res == NULL)
 					return;
@@ -245,15 +237,7 @@ static void wpa_driver_gdm_scanresp(struct wpa_driver_gdm_data *drv,
 				*pos++ = 0; /* WLAN_EID_SSID = 0 */
 				*pos++ = ssid_len;
 				os_memcpy(pos, ssid, ssid_len);
-				//res->caps = 0x11;
-				//res->caps = IEEE80211_CAP_PRIVACY;
-				res->freq = 3200;
-				
-				//pos += ssid_len;
-				//u8 buf[8] = {WLAN_EID_VENDOR_SPECIFIC, 6};
-				//WPA_PUT_BE32(&buf[2],WPA_IE_VENDOR_TYPE);
-				//WPA_PUT_LE16(&buf[6],WPA_VERSION);
-				//os_memcpy(pos, buf, 8);
+				//res->freq = 3200;
 				break;
 			case TLV_T(T_CINR):
 				if(res)
@@ -310,33 +294,65 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 		msg = (struct gdm_msghdr *)NLMSG_DATA(h);
 		u16 type = be_to_host16(msg->type);
 		u16 length = be_to_host16(msg->length);
-		//u8 *pos;
-		//pos = (u8 *)msg->data;
 		int i;
 		
 		switch (type)
 		{
 			case WIMAX_GET_INFO_RESULT:
 			{
+				struct gdm_subscription_list *list;
 				for (i=0; i < length;)
 				{
+					
 					//pos = *msg->data[i];
 					switch(msg->data[i])
 					{
-						case TLV_T(T_MAC_ADDRESS):
+						case TLV_T(T_H_NSPID):
 						{
-							wpa_hexdump(MSG_MSGDUMP, "tlv mac", &(msg->data[i])+2, TLV_L(T_MAC_ADDRESS));
-							
-							i += TLV_L(T_MAC_ADDRESS) + 2;
+							if (list) { 
+								os_free(drv->ss_list[drv->ss_list_len]);
+								drv->ss_list[drv->ss_list_len++] = list;
+								list = NULL;
+							}
+							list = os_zalloc(sizeof(*list));
+							if (list == NULL)
+								return;
+							os_memcpy(list->nspid, &msg->data[i+2], msg->data[i+1]);
 							break;
 						}
+						case TLV_T(T_NSP_NAME):
+						{
+							if (list) {
+								os_memcpy(list->nsp_name, &msg->data[i+2], msg->data[i+1]);
+								list->nsp_name_len = msg->data[i+1];
+							}
+							break;
+						}
+						case TLV_T(T_SUBSCRIPTION_NAME):
+						{
+							if (list) {
+								os_memcpy(list->name, &msg->data[i+2], msg->data[i+1]);
+								list->name_len = msg->data[i+1];
+							}					
+							break;
+						}
+						/*
 						case TLV_T(T_SUBSCRIPTION_LIST):
 						{
 							i += 4;
 							break;
 						}
-						
+						*/
 					}
+					if (msg->data[i] == TLV_T(T_SUBSCRIPTION_LIST))
+						i += 4;
+					else
+						i += 2 + msg->data[i+1];
+				}
+				if (list) {
+					os_free(drv->ss_list[drv->ss_list_len]);
+					drv->ss_list[drv->ss_list_len++] = list;
+					list = NULL;
 				}
 				break;
 			}
@@ -367,11 +383,15 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 			}
 			case WIMAX_ASSOC_COMPLETE:
 			{
-				/* TODO check for 0xff = fail 0x00 = ok */
+				/* TODO check for 0xff == fail and fill wpa_event_data::assoc_reject*/
+				if(&msg->data[0])
+					wpa_supplicant_event(drv->ctx, EVENT_ASSOC_REJECT , NULL);
+				break;
+			}
+			case WIMAX_CONNECT_COMPLETE:
+			{
 				//if(&msg->data[0])
 				//	wpa_supplicant_event(drv->ctx, EVENT_DISASSOC, NULL);
-				//else
-				//	wpa_supplicant_event(drv->ctx, EVENT_ASSOC, NULL);
 				break;
 			}
 			case WIMAX_DISCONN_IND:
@@ -396,7 +416,7 @@ static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 	struct sockaddr_nl local;
 	int idx;
 	
-wpa_printf(MSG_INFO, "GDM [init]: ifname(%s)", ifname);
+wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 
 	drv = os_zalloc(sizeof(*drv));
 	if (drv == NULL)
@@ -406,15 +426,19 @@ wpa_printf(MSG_INFO, "GDM [init]: ifname(%s)", ifname);
 	os_strlcpy(drv->ifname, ifname, sizeof(drv->ifname));
 	drv->ifindex = if_nametoindex(drv->ifname);
 	sscanf(drv->ifname, "%d", &idx);
-
-	os_memcpy(drv->own_addr, "\x00\x11\xa4\x80\x0d\x82", ETH_ALEN);
-//os_memcpy(drv->bssid, "\x00\x01\x02\x03\x04\x05", ETH_ALEN);	
+	
+	drv->ioctl_sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (drv->netlink_sock < 0) {
+		wpa_printf(MSG_ERROR, "GDM [%s]: Failed to open ioctl "
+			   "socket: %s", __FUNCTION__, strerror(errno));
+		goto error_ioctl;
+	}
 	
 	drv->netlink_sock = socket(PF_NETLINK, SOCK_RAW, NETLINK_WIMAX);
 	if (drv->netlink_sock < 0) {
 		wpa_printf(MSG_ERROR, "GDM [%s]: Failed to open netlink "
 			   "socket: %s", __FUNCTION__, strerror(errno));
-		goto error;
+		goto error_netlink;
 	}
 	
 	os_memset(&local, 0, sizeof(local));
@@ -427,20 +451,28 @@ wpa_printf(MSG_INFO, "GDM [init]: ifname(%s)", ifname);
 	{
 		wpa_printf(MSG_ERROR, "GDM [%s]: Failed to bind netlink "
 			   "socket: %s", __FUNCTION__, strerror(errno));
-		goto error_netlink;
+		goto error;
 	}
 	
 	eloop_register_read_sock(drv->netlink_sock, wpa_driver_gdm_netlink_receive, drv,
 				 NULL);
 	
-//	unsigned char buf[]={TLV_T(T_SUBSCRIPTION_LIST)};
+	
+	/* Get subscription list from modem memory */
+	u8 buf[]={TLV_T(T_SUBSCRIPTION_LIST)};
+	wpa_driver_gdm_netlink_send(drv, WIMAX_GET_INFO, buf, sizeof(buf));	
+
+	/* TODO: get cert files from modem memory and put them to wpa_config_blob's*/
+	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_RADIO_ON, NULL, 0);	
 	
 	return drv;
 	
+error:
+	close(drv->netlink_sock);	
 error_netlink:
-	close(drv->netlink_sock);
-error:	
+	close(drv->ioctl_sock);
+error_ioctl:
 	return NULL;
 }
 
@@ -457,12 +489,14 @@ static void wpa_driver_gdm_deinit(void *priv)
 		close(drv->netlink_sock);
 	}
 	
+	if (drv->ioctl_sock >= 0)
+		close(drv->ioctl_sock);
 	os_free(drv);
 }
 
 static void wpa_driver_gdm_scan_timeout(void *eloop_ctx, void *timeout_ctx)
 {
-	wpa_printf(MSG_DEBUG, "Scan timeout - try to get results");
+	wpa_printf(MSG_DEBUG, "GDM [%s] Scan timeout - try to get results", __FUNCTION__);
 	wpa_supplicant_event(timeout_ctx, EVENT_SCAN_RESULTS, NULL);
 }
 
@@ -472,15 +506,15 @@ static int wpa_driver_gdm_scan(void *priv,
 	struct wpa_driver_gdm_data *drv = priv;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
-/*	*/
-	unsigned char buf[]={W_SCAN_SPECIFIED_SUBSCRIPTION, 0xd2, 0x03, 0x00, 0x00, 0x32};
+	/* TODO: free() all *scanres, otherwise memory leak can occur */
+	drv->num_scanres = 0; 
+	/* TODO: if ssid is set then W_SCAN_SPECIFIED_SUBSCRIPTION */
+	unsigned char buf[]={W_SCAN_ALL_SUBSCRIPTION};
 	wpa_driver_gdm_netlink_send(drv, WIMAX_SCAN, buf, sizeof(buf));
 	
 	eloop_cancel_timeout(wpa_driver_gdm_scan_timeout, drv, drv->ctx);
-	eloop_register_timeout(45, 0, wpa_driver_gdm_scan_timeout, drv,
-			       drv->ctx);
-				   
-	//wpa_supplicant_event(drv->ctx, EVENT_SCAN_RESULTS, NULL);			   
+	eloop_register_timeout(90, 0, wpa_driver_gdm_scan_timeout, drv,
+			       drv->ctx);	   
 	return 0;
 }
 
@@ -504,7 +538,7 @@ wpa_driver_gdm_get_scan_results(void *priv)
 		os_free(res);
 		return NULL;
 	}	
-/*		*/
+
 	for (i = 0; i < drv->num_scanres; i++) {
 		struct wpa_scan_res *r;
 		if (drv->scanres[i] == NULL)
@@ -518,85 +552,44 @@ wpa_driver_gdm_get_scan_results(void *priv)
 	}
 
 	return res;	
-	
-/*
-	size_t extra_len = 0;
-	extra_len += 2 + 16 + 8;
-	
-	struct wpa_scan_res *r = NULL;
-	u8 *pos2;
-	r = os_zalloc(sizeof(*r) + extra_len);
-	if (r == NULL) {
-		return NULL;
-	}
-	res->res[res->num++] = r;
-	
-	u8 ssid[] = "FRESHTEL_Ukraine";
-
-	r->ie_len = extra_len;
-	pos2 = (u8 *) (r + 1);
-	*pos2++ = 0; //WLAN_EID_SSID
-	*pos2++ = 16;
-	os_memcpy(pos2, ssid, 16);
-			os_memcpy(drv->ssid, ssid, 16);
-	r->caps = 0x11;
-	
-	os_memcpy(r->bssid, "\x00\x01\x02\x03\x04\x05", ETH_ALEN);
-	wpa_hexdump(MSG_MSGDUMP, "lala1", (u8 *) (r + 1), extra_len);	
-	r->freq = 3200;
-	pos2 += 16;
-#define WLAN_EID_VENDOR_SPECIFIC   221	
-#define WPA_IE_VENDOR_TYPE 0x0050f201
-#define WPA_VERSION   1	
-	u8 buf[8] = {WLAN_EID_VENDOR_SPECIFIC, 6};
-	WPA_PUT_BE32(&buf[2],WPA_IE_VENDOR_TYPE);
-	WPA_PUT_LE16(&buf[6],WPA_VERSION);
-	os_memcpy(pos2, buf, 8);
-	wpa_hexdump(MSG_MSGDUMP, "lala2", buf, 6);
-	wpa_hexdump(MSG_MSGDUMP, "lala3", (u8 *) (r + 1), extra_len);		
-
-	return res;	*/
-}
-
-static int wpa_driver_gdm_deauthenticate(void *priv, const u8 *addr,
-					  int reason_code)
-{
-	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
-	return 0;
 }
 
 static int wpa_driver_gdm_disassociate(void *priv, const u8 *addr,
 					int reason_code)
 {
-	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
-	return 0;
-}
-
-static int wpa_driver_gdm_set_countermeasures(void *priv, int enabled)
-{
-	wpa_printf(MSG_DEBUG, "GDM [%s] %d", __FUNCTION__, enabled);
-	return 0;
-}
-
-static int
-wpa_driver_gdm_associate(void *priv,
-			   struct wpa_driver_associate_params *params)
-{
 	struct wpa_driver_gdm_data *drv = priv;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
 	
-	u8 buf2[] = {TLV_T(T_ENABLE_AUTH), 0x01, 0x01};
-	wpa_driver_gdm_netlink_send(drv, WIMAX_SET_INFO, buf2, sizeof(buf2));
-	
-	u8 buf[] = {TLV_T(T_H_NSPID), 0x03, 0x00, 0x00, 0x32, TLV_T(T_V_NSPID), 0x03, 0x00, 0x00, 0x32};
-	wpa_driver_gdm_netlink_send(drv, WIMAX_CONNECT, buf, sizeof(buf));
-	
-/*	wpa_supplicant_event(drv->ctx, EVENT_ASSOC, NULL);
-	u8 data[] = {EAPOL_VERSION, IEEE802_1X_TYPE_EAP_PACKET, 0x00, 0x05, 0x01, 0x01, 0x00, 0x05, 0x01};
-	drv_event_eapol_rx(drv->ctx, drv->bssid, data, sizeof(data));	*/
-	
+	wpa_driver_gdm_netlink_send(drv, WIMAX_NET_DISCONN, NULL, 0);
 	return 0;
+}
+
+static int wpa_driver_gdm_associate(void *priv,
+			   struct wpa_driver_associate_params *params)
+{
+	struct wpa_driver_gdm_data *drv = priv;
+	size_t i;
+	
+	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
+	
+	for(i = 0; i < drv->ss_list_len; i++)
+		if (drv->ss_list[i]->nsp_name_len == params->ssid_len && 
+				!os_memcmp(drv->ss_list[i]->nsp_name, params->ssid, params->ssid_len))
+		{
+			os_memcpy(drv->ssid, params->ssid, params->ssid_len);
+			drv->ssid_len = params->ssid_len;
+			u8 buf2[] = {TLV_T(T_ENABLE_AUTH), TLV_L(T_ENABLE_AUTH), 0x01};
+			wpa_driver_gdm_netlink_send(drv, WIMAX_SET_INFO, buf2, sizeof(buf2));
+			
+			u8 buf[] = {TLV_T(T_H_NSPID), TLV_L(T_H_NSPID), 0x00, 0x00, 0x00, TLV_T(T_V_NSPID), TLV_L(T_V_NSPID), 0x00, 0x00, 0x00};
+			os_memcpy(&buf[2], drv->ss_list[i]->nspid, TLV_L(T_H_NSPID));
+			os_memcpy(&buf[7], drv->ss_list[i]->nspid, TLV_L(T_H_NSPID)); /* TODO: use T_V_NSPID */
+			wpa_driver_gdm_netlink_send(drv, WIMAX_CONNECT, buf, sizeof(buf));
+			return 0;
+		}
+	drv->ssid_len = 0;
+	return -1;
 }
 
 const struct wpa_driver_ops wpa_driver_gdm_ops = {
@@ -606,14 +599,10 @@ const struct wpa_driver_ops wpa_driver_gdm_ops = {
 	.get_ssid = wpa_driver_gdm_get_ssid,
 	.get_mac_addr = wpa_driver_gdm_get_mac_addr,
 	.send_eapol = wpa_driver_gdm_send_eapol,
-	.set_key = wpa_driver_gdm_set_key,
 	.init = wpa_driver_gdm_init,
 	.deinit = wpa_driver_gdm_deinit,
-	.set_countermeasures = wpa_driver_gdm_set_countermeasures,
 	.scan2 = wpa_driver_gdm_scan,
 	.get_scan_results2 = wpa_driver_gdm_get_scan_results,
-	.deauthenticate = wpa_driver_gdm_deauthenticate,
 	.disassociate = wpa_driver_gdm_disassociate,
 	.associate = wpa_driver_gdm_associate,
-//	.set_operstate = wpa_driver_gdm_set_operstate,
 };
