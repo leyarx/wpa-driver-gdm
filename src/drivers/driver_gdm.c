@@ -8,13 +8,13 @@
 #include "common/eapol_common.h"
 
 #include "gdm72xx_hci.h"
-
+#include "wm_ioctl.h"
 #include <net/if.h>
 
 #include "eapol_supp/eapol_supp_sm.h"
 #include "../wpa_supplicant/wpa_supplicant_i.h"
 
-#define NETLINK_WIMAX	31
+//#define NETLINK_WIMAX	31
 
 struct gdm_subscription_list {
 	u8 		name[32];
@@ -22,6 +22,19 @@ struct gdm_subscription_list {
 	u8 		nspid[3];
 	u8 		nsp_name[32];
 	size_t 	nsp_name_len;
+};
+
+#define GDM_IMG_XML			0x0100
+#define GDM_IMG_DEVCERT		0x0101
+#define GDM_IMG_SRVROOTCA	0x0102
+#define GDM_IMG_DEVROOTCA	0x0103
+#define GDM_IMG_DEVSUBCA	0x0104
+#define GDM_IMG_EAPPARAM	0x0105
+#define GDM_IMG_SRVCAS		0x0106
+
+struct gdm_ul_image {
+	u8 		*buf;
+	size_t	len;
 };
 				
 struct wpa_driver_gdm_data {
@@ -38,6 +51,8 @@ struct wpa_driver_gdm_data {
 	struct gdm_subscription_list *ss_list[MAX_SUBSCRIPTIONS];
 	size_t	ss_list_len;
 	
+	struct gdm_ul_image img_buf[7]; /* number of GDM_IMG_* */
+	
 	u8 bssid[ETH_ALEN];
 	u8 ssid[32];
 	size_t ssid_len;
@@ -49,8 +64,86 @@ struct gdm_msghdr{
 		u8 		data[0];
 } STRUCT_PACKED;
 
+struct gdm_imghdr{
+	be16 	type;
+	be32	offset;
+	u8 		data[0];
+} STRUCT_PACKED;
+
 static void wpa_driver_gdm_scan_timeout(void *eloop_ctx, void *timeout_ctx);
 static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 type, u8 *data, size_t len);
+static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d);
+
+static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
+{
+	u8 buf[6];
+	
+	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x)", __FUNCTION__, host_to_be16(type));
+	
+	os_memset(buf, 0, sizeof(buf));
+	WPA_PUT_BE16(buf, type);
+	
+	wpa_driver_gdm_netlink_send(drv, WIMAX_UL_IMAGE, buf, sizeof(buf));
+}
+
+static void wpa_driver_gdm_get_img_status(struct wpa_driver_gdm_data *drv, u16 type, u32 offset)
+{
+	u8 buf[10];
+	
+	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x) (offset %08x)", __FUNCTION__, type, offset);
+	
+	os_memset(buf, 0, sizeof(buf));
+	WPA_PUT_BE16(buf, type);	
+	WPA_PUT_BE32(buf + 2, offset);
+	
+	wpa_driver_gdm_netlink_send(drv, WIMAX_UL_IMAGE_STATUS, buf, sizeof(buf));
+}
+
+static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
+						const unsigned char *data,
+						int len)
+{
+	struct gdm_imghdr *hdr;
+	struct gdm_ul_image *img;
+	u16 type;
+	u32 offset;
+	hdr = (struct gdm_imghdr *) data;
+	type = be_to_host16(hdr->type);
+	offset = be_to_host32(hdr->offset);
+	img = &drv->img_buf[type & 0xff];
+	
+	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x) (offset %08x)", __FUNCTION__, type, offset);
+	
+	if (offset == 0xffffffff && img->buf == NULL)
+	{
+		wpa_printf(MSG_INFO, "Device image %04x is empty", type);
+		return;
+	} 
+	else if (offset == 0xffffffff && img->buf)
+	{
+		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);
+		
+		/* TODO: decrypt, unpack, write to blob & free img buf */
+		
+		os_free(img->buf);
+		img->buf = NULL;
+		img->len = 0;
+		return;		
+	}
+	else if (!offset && img->buf == NULL && len > sizeof(struct gdm_imghdr))
+	{
+		img->len = len - sizeof(struct gdm_imghdr);
+		img->buf = (u8 *)os_zalloc(16384);
+		os_memcpy(img->buf, hdr->data, img->len);
+	}
+	else if (offset && img->buf && len > sizeof(struct gdm_imghdr))
+	{
+		os_memcpy(img->buf + img->len, hdr->data, len - sizeof(struct gdm_imghdr));
+		img->len += len - sizeof(struct gdm_imghdr);
+	}
+	
+	wpa_driver_gdm_get_img_status(drv, type, offset);
+}
 
 static int wpa_driver_gdm_get_bssid(void *priv, u8 *bssid)
 {
@@ -376,6 +469,7 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 			}
 			case WIMAX_ASSOC_START:
 			{
+				wpa_driver_gdm_ioctl_send_status(drv, M_CONNECTING, C_ASSOCSTART, D_INIT);
 				/* TODO write bsid to struct */
 				os_memcpy(drv->bssid, &msg->data[7], ETH_ALEN);
 				wpa_supplicant_event(drv->ctx, EVENT_ASSOC, NULL);
@@ -384,20 +478,30 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 			case WIMAX_ASSOC_COMPLETE:
 			{
 				/* TODO check for 0xff == fail and fill wpa_event_data::assoc_reject*/
-				if(&msg->data[0])
+				if(msg->data[0])
 					wpa_supplicant_event(drv->ctx, EVENT_ASSOC_REJECT , NULL);
+				else
+					wpa_driver_gdm_ioctl_send_status(drv, M_CONNECTING, C_ASSOCCOMPLETE, D_INIT);
 				break;
 			}
 			case WIMAX_CONNECT_COMPLETE:
 			{
-				//if(&msg->data[0])
-				//	wpa_supplicant_event(drv->ctx, EVENT_DISASSOC, NULL);
+				if(msg->data[0])
+					wpa_driver_gdm_ioctl_send_status(drv, M_INIT, C_INIT, D_INIT);
+				else
+					wpa_driver_gdm_ioctl_send_status(drv, M_CONNECTED, C_CONNCOMPLETE, D_INIT);
 				break;
 			}
 			case WIMAX_DISCONN_IND:
 			{
+				wpa_driver_gdm_ioctl_send_status(drv, M_INIT, C_INIT, D_INIT);
 				/* TODO print disconnect reason */
 				wpa_supplicant_event(drv->ctx, EVENT_DISASSOC, NULL);
+				break;
+			}
+			case WIMAX_UL_IMAGE_RESULT:
+			{
+				wpa_driver_gdm_get_img_result(drv, msg->data, length);
 				break;
 			}
 			default:
@@ -410,13 +514,34 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 
 }
 
+static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d)
+{
+	struct wm_req_s req;
+	struct fsm_s set;
+	
+	wpa_printf(MSG_DEBUG, "GDM [%s] (main status %d) (connection status %d) (oma-dm status %d)",
+						__FUNCTION__, m, c, d);
+
+	os_strncpy(req.ifr_ifrn.ifrn_name, drv->ifname, IFNAMSIZ-1);
+	req.cmd = SIOCS_DATA;
+	req.data_id = SIOC_DATA_FSM;
+	req.data.size = sizeof(struct fsm_s);
+	set.m_status = m;
+	set.c_status = c; 
+	set.d_status = d;
+	req.data.buf = &set;
+	
+	if (ioctl(drv->ioctl_sock, SIOCWMIOCTL, &req) == -1)
+		wpa_printf(MSG_ERROR, "Failed to send status");
+}
+
 static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 {
 	struct wpa_driver_gdm_data *drv;
 	struct sockaddr_nl local;
 	int idx;
 	
-wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
+	wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 
 	drv = os_zalloc(sizeof(*drv));
 	if (drv == NULL)
@@ -428,7 +553,7 @@ wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 	sscanf(drv->ifname, "%d", &idx);
 	
 	drv->ioctl_sock = socket(AF_INET, SOCK_DGRAM, 0);
-	if (drv->netlink_sock < 0) {
+	if (drv->ioctl_sock < 0) {
 		wpa_printf(MSG_ERROR, "GDM [%s]: Failed to open ioctl "
 			   "socket: %s", __FUNCTION__, strerror(errno));
 		goto error_ioctl;
@@ -444,7 +569,7 @@ wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 	os_memset(&local, 0, sizeof(local));
 	
 	local.nl_family = AF_NETLINK;
-	local.nl_groups = idx+1;	// ifindex+1
+	local.nl_groups = 1;	// ifindex+1 idx+1
 	local.nl_pid = getpid();
 
 	if (bind(drv->netlink_sock, (struct sockaddr *) &local, sizeof(local)) < 0)
@@ -454,15 +579,22 @@ wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 		goto error;
 	}
 	
-	eloop_register_read_sock(drv->netlink_sock, wpa_driver_gdm_netlink_receive, drv,
-				 NULL);
+	if (eloop_register_read_sock(drv->netlink_sock, wpa_driver_gdm_netlink_receive
+					, drv, NULL))
+	{
+		wpa_printf(MSG_ERROR, "GDM [%s]: Failed to register netlink "
+			   "socket handler: %s", __FUNCTION__, strerror(errno));		
+		goto error;
+	}
 	
+	wpa_driver_gdm_ioctl_send_status(drv, M_INIT, C_INIT, D_INIT);
 	
 	/* Get subscription list from modem memory */
 	u8 buf[]={TLV_T(T_SUBSCRIPTION_LIST)};
 	wpa_driver_gdm_netlink_send(drv, WIMAX_GET_INFO, buf, sizeof(buf));	
 
 	/* TODO: get cert files from modem memory and put them to wpa_config_blob's*/
+	//wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_RADIO_ON, NULL, 0);	
 	
@@ -511,6 +643,8 @@ static int wpa_driver_gdm_scan(void *priv,
 	/* TODO: if ssid is set then W_SCAN_SPECIFIED_SUBSCRIPTION */
 	unsigned char buf[]={W_SCAN_ALL_SUBSCRIPTION};
 	wpa_driver_gdm_netlink_send(drv, WIMAX_SCAN, buf, sizeof(buf));
+	
+	wpa_driver_gdm_ioctl_send_status(drv, M_SCAN, C_INIT, D_INIT);
 	
 	eloop_cancel_timeout(wpa_driver_gdm_scan_timeout, drv, drv->ctx);
 	eloop_register_timeout(90, 0, wpa_driver_gdm_scan_timeout, drv,
@@ -581,7 +715,7 @@ static int wpa_driver_gdm_associate(void *priv,
 			drv->ssid_len = params->ssid_len;
 			u8 buf2[] = {TLV_T(T_ENABLE_AUTH), TLV_L(T_ENABLE_AUTH), 0x01};
 			wpa_driver_gdm_netlink_send(drv, WIMAX_SET_INFO, buf2, sizeof(buf2));
-			
+			wpa_driver_gdm_ioctl_send_status(drv, M_CONNECTING, C_CONNSTART, D_INIT);
 			u8 buf[] = {TLV_T(T_H_NSPID), TLV_L(T_H_NSPID), 0x00, 0x00, 0x00, TLV_T(T_V_NSPID), TLV_L(T_V_NSPID), 0x00, 0x00, 0x00};
 			os_memcpy(&buf[2], drv->ss_list[i]->nspid, TLV_L(T_H_NSPID));
 			os_memcpy(&buf[7], drv->ss_list[i]->nspid, TLV_L(T_H_NSPID)); /* TODO: use T_V_NSPID */
