@@ -11,6 +11,9 @@
 #include "wm_ioctl.h"
 #include <net/if.h>
 
+#include <openssl/pem.h>
+#include <openssl/x509v3.h>
+
 #include <eap_peer/eap_config.h>
 #include "eapol_supp/eapol_supp_sm.h"
 #include "../wpa_supplicant/wpa_supplicant_i.h"
@@ -72,9 +75,88 @@ struct gdm_imghdr{
 	u8 		data[0];
 } STRUCT_PACKED;
 
+#define PEM_CERT_KEYWORD "CERTIFICATE"
+#define PEM_PRIVATEKEY_KEYWORD "PRIVATE KEY"
+
+typedef enum {
+	PEM_CERTIFICATE,
+	PEM_PRIVATE_KEY,
+	DER_FORMAT,
+	UNKNOWN_CERT_TYPE
+} CERT_TYPE;
+
 static void wpa_driver_gdm_scan_timeout(void *eloop_ctx, void *timeout_ctx);
 static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 type, u8 *data, size_t len);
 static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d);
+
+/*
+ * Tell the encoding format and type of the certificate/key by examining if
+ * there is "CERTIFICATE" or "PRIVATE KEY" in the blob. If not, at least we
+ * can test if the first byte is '0'.
+ */
+static CERT_TYPE get_blob_type(struct wpa_config_blob *blob)
+{
+	CERT_TYPE type = UNKNOWN_CERT_TYPE;
+	unsigned char p = blob->data[blob->len - 1];
+
+	blob->data[blob->len - 1] = 0;
+	if (strstr((const char *)blob->data, PEM_CERT_KEYWORD) != NULL) {
+		type = PEM_CERTIFICATE;
+	} else if (strstr((const char *)blob->data, PEM_PRIVATEKEY_KEYWORD) != NULL) {
+		type = PEM_PRIVATE_KEY;
+	} else if (blob->data[0] == '0') {
+		type = DER_FORMAT;
+	}
+	blob->data[blob->len - 1] = p;
+	return type;
+}
+
+/*
+ * convert_pem2der() provides the converion from PEM format to DER one, since
+ * original certificate handling does not accept the PEM format for blob data.
+ * Therefore, we need to convert the data to DER format if it is PEM-format.
+ */
+static void convert_pem2der(struct wpa_config_blob *blob)
+{
+	X509 *cert = NULL;
+	EVP_PKEY *pkey = NULL;
+	BIO *bp = NULL;
+	unsigned char *buf = NULL;
+	int len = 0;
+	CERT_TYPE type;
+
+	if (blob->len < sizeof(PEM_CERT_KEYWORD)) {
+		return;
+	}
+
+	if (((type = get_blob_type(blob)) != PEM_CERTIFICATE) &&
+		(type != PEM_PRIVATE_KEY)) {
+		return;
+	}
+
+	bp = BIO_new(BIO_s_mem());
+	if (!bp) goto err;
+	if (!BIO_write(bp, blob->data, blob->len)) goto err;
+	if (type == PEM_CERTIFICATE) {
+		if ((cert = PEM_read_bio_X509(bp, NULL, NULL, NULL)) != NULL) {
+			len = i2d_X509(cert, &buf);
+		}
+	} else {
+		if ((pkey = PEM_read_bio_PrivateKey(bp, NULL, NULL, NULL)) != NULL) {
+			len = i2d_PrivateKey(pkey, &buf);
+		}
+	}
+
+err:
+	if (bp) BIO_free(bp);
+	if (cert) X509_free(cert);
+	if (pkey) EVP_PKEY_free(pkey);
+	if (buf) {
+		free(blob->data);
+		blob->data = buf;
+		blob->len = len;
+	}
+}
 
 static int wpa_driver_gdm_uncompress_img( void *data, size_t size )
 {
@@ -736,7 +818,7 @@ static int wpa_driver_gdm_scan(void *priv,
 	
 	eloop_cancel_timeout(wpa_driver_gdm_scan_timeout, drv, drv->ctx);
 	eloop_register_timeout(90, 0, wpa_driver_gdm_scan_timeout, drv,
-			       drv->ctx);	   
+				drv->ctx);	   
 	return 0;
 }
 
