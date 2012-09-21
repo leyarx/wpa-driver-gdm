@@ -1,19 +1,20 @@
 #include "includes.h"
 #include <sys/ioctl.h>
-
+#include "zlib.h"
 #include "common.h"
 #include "driver.h"
 #include "eloop.h"
 #include "priv_netlink.h"
 #include "common/eapol_common.h"
-
+#include "crypto/crypto.h"
 #include "gdm72xx_hci.h"
 #include "wm_ioctl.h"
 #include <net/if.h>
 
+#include <eap_peer/eap_config.h>
 #include "eapol_supp/eapol_supp_sm.h"
 #include "../wpa_supplicant/wpa_supplicant_i.h"
-
+#include "../wpa_supplicant/config.h"
 //#define NETLINK_WIMAX	31
 
 struct gdm_subscription_list {
@@ -52,6 +53,7 @@ struct wpa_driver_gdm_data {
 	size_t	ss_list_len;
 	
 	struct gdm_ul_image img_buf[7]; /* number of GDM_IMG_* */
+	struct wpa_config_blob * 	blobs;
 	
 	u8 bssid[ETH_ALEN];
 	u8 ssid[32];
@@ -73,6 +75,79 @@ struct gdm_imghdr{
 static void wpa_driver_gdm_scan_timeout(void *eloop_ctx, void *timeout_ctx);
 static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 type, u8 *data, size_t len);
 static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d);
+
+static int wpa_driver_gdm_uncompress_img( void *data, size_t size )
+{
+	int fd[2];
+	voidp gz;
+	int len;
+	
+	if(pipe(fd) < 0){
+		wpa_printf(MSG_ERROR, "Can't open pipe to uncompress image");	
+		return -1;
+	}
+	len = write( fd[1], data, size);
+	close(fd[1]);
+	gz = gzdopen(fd[0],"rb");
+	if (gz == NULL)
+	{
+		wpa_printf(MSG_ERROR, "Error open gz image");		
+		return -1;
+	}
+	len = gzread(gz, data, 16384); /* 16384 max len depend on compress level "now parameter len*2 testing" */
+	gzclose(gz);
+		
+	return len;
+}
+
+static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data, size_t len)
+{
+	u8 buf[len], shakey[0x18];
+	const u8 *addr[1];
+	size_t addr_len[1];
+	addr[0] = drv->mac_addr;
+	addr_len[0] = ETH_ALEN;
+	void *aes_ctx;
+	u8 *pos = data;
+	u8 iv[16] = {0x43,0x6c,0x61,0x72,0x6b,0x4a,0x4a,0x61,0x6e,0x67,0x00,0x00,0x00,0x00,0x00,0x00}; /* ClarkJJang */
+	int i, j;
+	
+	struct gdm_decimghdr{
+	be32	len;
+	u8 		data[0];
+	} STRUCT_PACKED;
+	
+	struct gdm_decimghdr *dec_data;
+	
+	memset(buf, 0, sizeof(buf));
+	memset(shakey, 0, sizeof(shakey));
+	
+	sha1_vector(1, addr, addr_len, shakey);
+	
+	aes_ctx = aes_decrypt_init(shakey, sizeof(shakey));
+	if (aes_ctx == NULL) {
+		wpa_printf(MSG_DEBUG, "aes_ctx init failed");
+		return -1;
+	}
+	
+	for (i = 0; i < len / 16; i++) {
+		aes_decrypt(aes_ctx, pos, pos);
+		for (j = 0; j < 16; j++)
+			pos[j] ^= iv[j];
+		pos += 16;
+	}
+
+	aes_decrypt_deinit(aes_ctx);
+	int dec_len;
+	dec_data = (struct gdm_decimghdr *) data;
+	dec_len = host_to_be32(dec_data->len);
+	os_memmove(data, dec_data->data, dec_len);
+	
+	/* TODO: add check for return value */
+	wpa_hexdump(MSG_MSGDUMP, "cbc_decrypt", data, dec_len);
+	
+	return dec_len;
+}
 
 static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 {
@@ -124,10 +199,23 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);
 		
 		/* TODO: decrypt, unpack, write to blob & free img buf */
-		
-		os_free(img->buf);
-		img->buf = NULL;
-		img->len = 0;
+		img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
+		if (img->len != -1) {
+			img->len = wpa_driver_gdm_uncompress_img(img->buf, img->len);
+			if (img->len != -1) {
+				wpa_hexdump(MSG_MSGDUMP, "uncompressed", img->buf, img->len);
+				struct wpa_config_blob * blob;
+				blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
+				blob->name = os_strdup("srvrootca");
+				blob->data = img->buf;
+				blob->len = img->len;	
+				struct wpa_supplicant *wpa_s = drv->ctx;
+				wpa_s->conf->blobs = blob;
+			}
+		}	
+		//os_free(img->buf);
+		//img->buf = NULL;
+		//img->len = 0;
 		return;		
 	}
 	else if (!offset && img->buf == NULL && len > sizeof(struct gdm_imghdr))
@@ -594,7 +682,7 @@ static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 	wpa_driver_gdm_netlink_send(drv, WIMAX_GET_INFO, buf, sizeof(buf));	
 
 	/* TODO: get cert files from modem memory and put them to wpa_config_blob's*/
-	//wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_RADIO_ON, NULL, 0);	
 	
