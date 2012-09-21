@@ -292,6 +292,10 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 				blob->data = img->buf;
 				blob->len = img->len;	
 				struct wpa_supplicant *wpa_s = drv->ctx;
+
+				/* covert blob from PEM to DER fromat */
+				convert_pem2der(blob);
+
 				wpa_s->conf->blobs = blob;
 			}
 		}	
