@@ -90,24 +90,44 @@ static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 typ
 static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d);
 
 /*
+ * Blob can consist from more then one certificate/key data,
+ * this function return pointer to the next certificate/key in blob data,
+ * return NULL if not found.
+ */ 
+static void * get_blob_data_next(u8 *data, int len)
+{
+	unsigned char p = data[len - 1];
+	char *ptr;
+	
+	if(len <= 0)
+		return NULL;
+	data[len - 1] = 0;
+	ptr = strstr((const char *)data, "\x2d\x0d\x0a\x2d");  // "END"
+	if(ptr)
+		ptr += 3;
+	data[len - 1] = p;
+	return ptr;
+}
+
+/*
  * Tell the encoding format and type of the certificate/key by examining if
  * there is "CERTIFICATE" or "PRIVATE KEY" in the blob. If not, at least we
  * can test if the first byte is '0'.
  */
-static CERT_TYPE get_blob_type(struct wpa_config_blob *blob)
+static CERT_TYPE get_blob_data_type(u8 *data, int len) //struct wpa_config_blob *blob
 {
 	CERT_TYPE type = UNKNOWN_CERT_TYPE;
-	unsigned char p = blob->data[blob->len - 1];
+	unsigned char p = data[len - 1];
 
-	blob->data[blob->len - 1] = 0;
-	if (strstr((const char *)blob->data, PEM_CERT_KEYWORD) != NULL) {
+	data[len - 1] = 0;
+	if (strstr((const char *)data, PEM_CERT_KEYWORD) != NULL) {
 		type = PEM_CERTIFICATE;
-	} else if (strstr((const char *)blob->data, PEM_PRIVATEKEY_KEYWORD) != NULL) {
+	} else if (strstr((const char *)data, PEM_PRIVATEKEY_KEYWORD) != NULL) {
 		type = PEM_PRIVATE_KEY;
-	} else if (blob->data[0] == '0') {
+	} else if (data[0] == '0') {
 		type = DER_FORMAT;
 	}
-	blob->data[blob->len - 1] = p;
+	data[len - 1] = p;
 	return type;
 }
 
@@ -124,38 +144,53 @@ static void convert_pem2der(struct wpa_config_blob *blob)
 	unsigned char *buf = NULL;
 	int len = 0;
 	CERT_TYPE type;
-
-	if (blob->len < sizeof(PEM_CERT_KEYWORD)) {
-		return;
-	}
-
-	if (((type = get_blob_type(blob)) != PEM_CERTIFICATE) &&
-		(type != PEM_PRIVATE_KEY)) {
-		return;
-	}
-
-	bp = BIO_new(BIO_s_mem());
-	if (!bp) goto err;
-	if (!BIO_write(bp, blob->data, blob->len)) goto err;
-	if (type == PEM_CERTIFICATE) {
-		if ((cert = PEM_read_bio_X509(bp, NULL, NULL, NULL)) != NULL) {
-			len = i2d_X509(cert, &buf);
+	u8 *data = blob->data;
+	u8 blob_data[16384];
+	int blob_data_len = 0;
+	int size;
+	int	blob_len = blob->len;
+	blob->len = 0;
+	
+	do {
+		size = blob_len - (data - blob->data);
+		if(size <= 0)
+			goto end;
+		if (size < sizeof(PEM_CERT_KEYWORD)) {
+			goto end;
 		}
-	} else {
-		if ((pkey = PEM_read_bio_PrivateKey(bp, NULL, NULL, NULL)) != NULL) {
-			len = i2d_PrivateKey(pkey, &buf);
+		if (((type = get_blob_data_type(data, size)) != PEM_CERTIFICATE) &&
+			(type != PEM_PRIVATE_KEY)) {
+			goto end;
 		}
-	}
-
+		bp = BIO_new(BIO_s_mem());
+		if (!bp) goto err;
+		if (!BIO_write(bp, data, size)) goto err;
+		if (type == PEM_CERTIFICATE) {
+			if ((cert = PEM_read_bio_X509(bp, NULL, NULL, NULL)) != NULL) {
+				len = i2d_X509(cert, &buf);
+			}
+		} else {
+			if ((pkey = PEM_read_bio_PrivateKey(bp, NULL, NULL, NULL)) != NULL) {
+				len = i2d_PrivateKey(pkey, &buf);
+			}
+		}
 err:
-	if (bp) BIO_free(bp);
-	if (cert) X509_free(cert);
-	if (pkey) EVP_PKEY_free(pkey);
-	if (buf) {
-		free(blob->data);
-		blob->data = buf;
-		blob->len = len;
-	}
+		if (bp) BIO_free(bp);
+		if (cert) X509_free(cert);
+		if (pkey) EVP_PKEY_free(pkey);
+		if (buf) {
+			os_memcpy(blob_data + blob_data_len, buf, len);
+			os_free(buf);
+			buf = NULL;
+			blob_data_len += len;
+		}
+		
+		data = get_blob_data_next(data, size);
+	} while(data != NULL);
+end:
+	os_memcpy(blob->data, blob_data, blob_data_len);
+	blob->len = blob_data_len;	
+	return;
 }
 
 static int wpa_driver_gdm_uncompress_img( void *data, size_t size )
@@ -222,7 +257,7 @@ static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data,
 	aes_decrypt_deinit(aes_ctx);
 	int dec_len;
 	dec_data = (struct gdm_decimghdr *) data;
-	dec_len = host_to_be32(dec_data->len);
+	dec_len = be_to_host32(dec_data->len);
 	os_memmove(data, dec_data->data, dec_len);
 	
 	/* TODO: add check for return value */
@@ -241,6 +276,19 @@ static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 	WPA_PUT_BE16(buf, type);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_UL_IMAGE, buf, sizeof(buf));
+}
+
+static void wpa_driver_gdm_get_imgs(struct wpa_driver_gdm_data *drv)
+{
+	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
+	/* TODO: get cert one by one, request next cert after receive the previous one */
+	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVCERT);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVROOTCA);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVSUBCA);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVCAS);
+	
+	//wpa_driver_gdm_get_img(drv, GDM_IMG_EAPPARAM);
 }
 
 static void wpa_driver_gdm_get_img_status(struct wpa_driver_gdm_data *drv, u16 type, u32 offset)
@@ -278,27 +326,74 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 	} 
 	else if (offset == 0xffffffff && img->buf)
 	{
-		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);
-		
+		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);	
 		/* TODO: decrypt, unpack, write to blob & free img buf */
-		img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
-		if (img->len != -1) {
-			img->len = wpa_driver_gdm_uncompress_img(img->buf, img->len);
-			if (img->len != -1) {
-				wpa_hexdump(MSG_MSGDUMP, "uncompressed", img->buf, img->len);
-				struct wpa_config_blob * blob;
-				blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
-				blob->name = os_strdup("srvrootca");
-				blob->data = img->buf;
-				blob->len = img->len;	
-				struct wpa_supplicant *wpa_s = drv->ctx;
+						
+		switch (type)
+		{
+			case GDM_IMG_XML:
+				break;
+			case GDM_IMG_DEVCERT:
+			case GDM_IMG_SRVROOTCA:
+			case GDM_IMG_DEVROOTCA:
+			case GDM_IMG_DEVSUBCA:
+			case GDM_IMG_SRVCAS:
+			{
+				img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
+				if (img->len != -1) {
+					img->len = wpa_driver_gdm_uncompress_img(img->buf, img->len);
+					if (img->len != -1) {
+						struct wpa_supplicant *wpa_s = drv->ctx;
+						struct wpa_config_blob * blobs = wpa_s->conf->blobs;
+						struct wpa_config_blob * blob;
+						
+						blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
+						wpa_hexdump(MSG_MSGDUMP, "uncompressed", img->buf, img->len);
 
-				/* covert blob from PEM to DER fromat */
-				convert_pem2der(blob);
-
-				wpa_s->conf->blobs = blob;
+						blob->data = img->buf;
+						blob->len = img->len;	
+						
+						/* covert blob from PEM to DER fromat */
+						convert_pem2der(blob);
+						wpa_hexdump(MSG_MSGDUMP, "pem->der", blob->data, blob->len);
+						
+						if (type == GDM_IMG_DEVCERT) 
+						{
+							blob->name = os_strdup("client_cert");
+							while(blobs)
+								blobs = blobs->next;
+							blobs = blob;
+							break;
+						}
+						else {
+							blob->name = os_strdup("ca_cert");
+							while(blobs && os_strcmp(blob->name, blobs->name))
+								blobs = blobs->next;
+							if (blobs)
+							{
+								u8 *blobs_buf;
+								blobs_buf = (u8 *) os_zalloc (blobs->len + blob->len);
+								os_memcpy(blobs_buf, blobs->data, blobs->len);
+								os_memcpy(blobs_buf + blobs->len, blob->data, blob->len);
+								os_free(blobs->data);
+								blobs->data = blobs_buf;
+								blobs->len += blob->len;
+								os_free(blob);
+							} else {
+								blobs = blob;
+							}
+						}
+					}
+				}
+				break;
 			}
-		}	
+			case GDM_IMG_EAPPARAM:
+			{
+				img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
+				/* TODO: if identity, anonymous identity, password, privatekey password is missed in *.conf then fill it from device memmory */
+				break;
+			}
+		}
 		//os_free(img->buf);
 		//img->buf = NULL;
 		//img->len = 0;
@@ -768,7 +863,7 @@ static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 	wpa_driver_gdm_netlink_send(drv, WIMAX_GET_INFO, buf, sizeof(buf));	
 
 	/* TODO: get cert files from modem memory and put them to wpa_config_blob's*/
-	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
+	wpa_driver_gdm_get_imgs(drv);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_RADIO_ON, NULL, 0);	
 	
