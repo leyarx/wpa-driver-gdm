@@ -685,6 +685,11 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 						case TLV_T(T_NSP_NAME):
 						{
 							if (list) {
+								if (list->nsp_name_len != 0) {
+									wpa_printf(MSG_DEBUG, "GDM [%s] list->nsp_name %s already exists! list->nsp_name_len: %d",
+										__FUNCTION__, list->nsp_name, list->nsp_name_len);
+									break;
+								}
 								os_memcpy(list->nsp_name, &msg->data[i+2], msg->data[i+1]);
 								list->nsp_name_len = msg->data[i+1];
 							}
