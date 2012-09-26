@@ -21,14 +21,14 @@
 //#define NETLINK_WIMAX	31
 
 struct gdm_subscription_list {
-	u8 		name[32];
+	u8 	name[32];
 	size_t 	name_len;
-	u8 		nspid[3];
-	u8 		nsp_name[32];
+	u8 	nspid[3];
+	u8 	nsp_name[32];
 	size_t 	nsp_name_len;
 };
 
-#define GDM_IMG_XML			0x0100
+#define GDM_IMG_XML		0x0100
 #define GDM_IMG_DEVCERT		0x0101
 #define GDM_IMG_SRVROOTCA	0x0102
 #define GDM_IMG_DEVROOTCA	0x0103
@@ -37,42 +37,42 @@ struct gdm_subscription_list {
 #define GDM_IMG_SRVCAS		0x0106
 
 struct gdm_ul_image {
-	u8 		*buf;
+	u8 	*buf;
 	size_t	len;
 };
 				
 struct wpa_driver_gdm_data {
-	void 	*ctx;
-	char 	ifname[IFNAMSIZ + 1];
-	int     ifindex;
-	int		netlink_sock;
-	int		ioctl_sock;
+	void	*ctx;
+	char	ifname[IFNAMSIZ + 1];
+	int	ifindex;
+	int	netlink_sock;
+	int	ioctl_sock;
 #define MAX_SCAN_RESULTS 30
-	struct 	wpa_scan_res *scanres[MAX_SCAN_RESULTS];
-	size_t 	num_scanres;
-	u8 mac_addr[ETH_ALEN];
+	struct	wpa_scan_res *scanres[MAX_SCAN_RESULTS];
+	size_t	num_scanres;
+	u8	mac_addr[ETH_ALEN];
 #define MAX_SUBSCRIPTIONS 255	
-	struct gdm_subscription_list *ss_list[MAX_SUBSCRIPTIONS];
+	struct	gdm_subscription_list *ss_list[MAX_SUBSCRIPTIONS];
 	size_t	ss_list_len;
 	
-	struct gdm_ul_image img_buf[7]; /* number of GDM_IMG_* */
-	struct wpa_config_blob * 	blobs;
+	struct	gdm_ul_image img_buf[7]; /* number of GDM_IMG_* */
+	struct	wpa_config_blob *blobs;
 	
-	u8 bssid[ETH_ALEN];
-	u8 ssid[32];
-	size_t ssid_len;
+	u8	bssid[ETH_ALEN];
+	u8	ssid[32];
+	size_t	ssid_len;
 };
 
 struct gdm_msghdr{
-		be16 	type;
-		be16 	length;
-		u8 		data[0];
+	be16	type;
+	be16	length;
+	u8	data[0];
 } STRUCT_PACKED;
 
 struct gdm_imghdr{
-	be16 	type;
+	be16	type;
 	be32	offset;
-	u8 		data[0];
+	u8	data[0];
 } STRUCT_PACKED;
 
 #define PEM_CERT_KEYWORD "CERTIFICATE"
@@ -88,13 +88,14 @@ typedef enum {
 static void wpa_driver_gdm_scan_timeout(void *eloop_ctx, void *timeout_ctx);
 static void wpa_driver_gdm_netlink_send(struct wpa_driver_gdm_data *drv, u16 type, u8 *data, size_t len);
 static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, int m, int c, int d);
+static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock_ctx);
 
 /*
  * Blob can consist from more then one certificate/key data,
  * this function return pointer to the next certificate/key in blob data,
  * return NULL if not found.
  */ 
-static void * get_blob_data_next(u8 *data, int len)
+static void *get_blob_data_next(u8 *data, int len)
 {
 	unsigned char p = data[len - 1];
 	char *ptr;
@@ -269,6 +270,7 @@ static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data,
 static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 {
 	u8 buf[6];
+	int i;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x)", __FUNCTION__, host_to_be16(type));
 	
@@ -276,6 +278,11 @@ static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 	WPA_PUT_BE16(buf, type);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_UL_IMAGE, buf, sizeof(buf));
+	/* TODO: reduce the sleep time and useless read, 17 times for 17KB EAPPARAM */
+	for (i = 0; i < 17; i++) {
+		os_sleep(0, 20000);
+		wpa_driver_gdm_netlink_receive(drv->netlink_sock, drv, drv->ctx);
+	}
 }
 
 static void wpa_driver_gdm_get_imgs(struct wpa_driver_gdm_data *drv)
@@ -868,6 +875,7 @@ static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 	wpa_driver_gdm_netlink_send(drv, WIMAX_GET_INFO, buf, sizeof(buf));	
 
 	/* TODO: get cert files from modem memory and put them to wpa_config_blob's*/
+	wpa_driver_gdm_get_mac_addr(drv);
 	wpa_driver_gdm_get_imgs(drv);
 	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_RADIO_ON, NULL, 0);	
