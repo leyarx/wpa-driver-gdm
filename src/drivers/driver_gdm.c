@@ -267,20 +267,28 @@ static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data,
 	return dec_len;
 }
 
+static void wpa_driver_gdm_get_img_timeout(void *eloop_ctx, void *timeout_ctx)
+{
+	wpa_printf(MSG_DEBUG, "GDM [%s] Get image timeout", __FUNCTION__);
+}
+
 static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 {
 	u8 buf[6];
-	int i;
 	
-	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x)", __FUNCTION__, host_to_be16(type));
+	wpa_printf(MSG_DEBUG, "GDM [%s] (type %04x)", __FUNCTION__, type);
 	
 	os_memset(buf, 0, sizeof(buf));
 	WPA_PUT_BE16(buf, type);
 	
+	eloop_register_timeout(5, 0, wpa_driver_gdm_get_img_timeout, drv,
+				drv->ctx);	
+	
 	wpa_driver_gdm_netlink_send(drv, WIMAX_UL_IMAGE, buf, sizeof(buf));
-	/* TODO: reduce the sleep time and useless read, 17 times for 17KB EAPPARAM */
-	for (i = 0; i < 17; i++) {
-		os_sleep(0, 20000);
+
+	while(eloop_is_timeout_registered(wpa_driver_gdm_get_img_timeout, drv, drv->ctx))
+	{
+		eloop_wait_for_read_sock(drv->netlink_sock);
 		wpa_driver_gdm_netlink_receive(drv->netlink_sock, drv, drv->ctx);
 	}
 }
@@ -288,14 +296,13 @@ static void wpa_driver_gdm_get_img(struct wpa_driver_gdm_data *drv, u16 type)
 static void wpa_driver_gdm_get_imgs(struct wpa_driver_gdm_data *drv)
 {
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
-	/* TODO: get cert one by one, request next cert after receive the previous one */
+
 	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVCERT);
 	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVROOTCA);
 	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVROOTCA);
 	wpa_driver_gdm_get_img(drv, GDM_IMG_DEVSUBCA);
 	wpa_driver_gdm_get_img(drv, GDM_IMG_SRVCAS);
-	
-	//wpa_driver_gdm_get_img(drv, GDM_IMG_EAPPARAM);
+	wpa_driver_gdm_get_img(drv, GDM_IMG_EAPPARAM);
 }
 
 static void wpa_driver_gdm_get_img_status(struct wpa_driver_gdm_data *drv, u16 type, u32 offset)
@@ -329,11 +336,13 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 	if (offset == 0xffffffff && img->buf == NULL)
 	{
 		wpa_printf(MSG_INFO, "Device image %04x is empty", type);
+		eloop_cancel_timeout(wpa_driver_gdm_get_img_timeout, drv, drv->ctx);
 		return;
 	} 
 	else if (offset == 0xffffffff && img->buf)
 	{
 		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);	
+		eloop_cancel_timeout(wpa_driver_gdm_get_img_timeout, drv, drv->ctx);
 		/* TODO: decrypt, unpack, write to blob & free img buf */
 						
 		switch (type)
@@ -350,11 +359,12 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 				if (img->len != -1) {
 					img->len = wpa_driver_gdm_uncompress_img(img->buf, img->len);
 					if (img->len != -1) {
-						struct wpa_supplicant *wpa_s = drv->ctx;
+						struct wpa_supplicant * wpa_s = drv->ctx;
 						struct wpa_config_blob * blobs = wpa_s->conf->blobs;
 						struct wpa_config_blob * blob;
 						
 						blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
+						
 						wpa_hexdump(MSG_MSGDUMP, "uncompressed", img->buf, img->len);
 
 						blob->data = img->buf;
@@ -370,11 +380,17 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 							while(blobs)
 								blobs = blobs->next;
 							blobs = blob;
+							if(wpa_s->conf->blobs == NULL)
+								wpa_s->conf->blobs = blobs;
 							break;
 						}
 						else {
 							blob->name = os_strdup("ca_cert");
-							while(blobs && os_strcmp(blob->name, blobs->name))
+							/* 
+							 * It's good to check for "blobs->name != NULL" otherwise os_strcmp cause segmentation fault.
+							 * But it's omitted for easy debug because wpa_supplicant also failed to segmentation fault in this case.
+							 */
+							while(blobs && os_strcmp(blob->name, blobs->name)) 
 								blobs = blobs->next;
 							if (blobs)
 							{
@@ -388,6 +404,8 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 								os_free(blob);
 							} else {
 								blobs = blob;
+								if(wpa_s->conf->blobs == NULL)
+									wpa_s->conf->blobs = blobs;
 							}
 						}
 					}
@@ -639,6 +657,7 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
 	
+	fromlen = sizeof(struct sockaddr_nl);
 	left = recvfrom(sock, buf, sizeof(buf), MSG_DONTWAIT,
 		(struct sockaddr *) &from, &fromlen);
 	if (left < 0) {
@@ -693,7 +712,7 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 						{
 							if (list) {
 								if (list->nsp_name_len != 0) {
-									wpa_printf(MSG_DEBUG, "GDM [%s] list->nsp_name %s already exists! list->nsp_name_len: %d",
+									wpa_printf(MSG_DEBUG, "GDM [%s] list->nsp_name %s already exists! list->nsp_name_len: %lu",
 										__FUNCTION__, list->nsp_name, list->nsp_name_len);
 									break;
 								}
@@ -918,14 +937,24 @@ static int wpa_driver_gdm_scan(void *priv,
 				  struct wpa_driver_scan_params *params)
 {
 	struct wpa_driver_gdm_data *drv = priv;
+	struct wpa_driver_scan_ssid *ssid;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s]", __FUNCTION__);
 	/* TODO: free() all *scanres, otherwise memory leak can occur */
 	drv->num_scanres = 0; 
-	/* TODO: if ssid is set then W_SCAN_SPECIFIED_SUBSCRIPTION */
-	unsigned char buf[]={W_SCAN_ALL_SUBSCRIPTION};
+
+	ssid = &params->ssids[0];
+	unsigned char buf[ssid->ssid ? (ssid->ssid_len + 3) : 1];
+	if (ssid->ssid == NULL) 
+	{
+		buf[0] = W_SCAN_ALL_SUBSCRIPTION;
+	} else {
+		buf[0] = W_SCAN_SPECIFIED_SUBSCRIPTION;
+		buf[1] = TLV_T(T_NSP_NAME);
+		buf[2] = ssid->ssid_len;
+		os_memcpy(buf + 3, ssid->ssid, ssid->ssid_len);
+	}
 	wpa_driver_gdm_netlink_send(drv, WIMAX_SCAN, buf, sizeof(buf));
-	
 	wpa_driver_gdm_ioctl_send_status(drv, M_SCAN, C_INIT, D_INIT);
 	
 	eloop_cancel_timeout(wpa_driver_gdm_scan_timeout, drv, drv->ctx);
