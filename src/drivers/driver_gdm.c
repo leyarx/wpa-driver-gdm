@@ -1,3 +1,18 @@
+/*
+ * WPA Supplicant - driver interaction with gdmwm driver (GDM72xx WiMAX chips)
+ * Copyright (c) 2012, Yaroslav Levandovskiy <leyarx@gmail.com>
+ * Copyright (c) 2012, Macpaul Lin <macpaul@gmail.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * Alternatively, this software may be distributed under the terms of BSD
+ * license.
+ *
+ * See README and COPYING for more details.
+ */
+ 
 #include "includes.h"
 #include <sys/ioctl.h>
 #include "zlib.h"
@@ -11,8 +26,12 @@
 #include "wm_ioctl.h"
 #include <net/if.h>
 
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <openssl/pkcs12.h>
+#include <openssl/err.h>
 
 #include <eap_peer/eap_config.h>
 #include "eapol_supp/eapol_supp_sm.h"
@@ -28,13 +47,18 @@ struct gdm_subscription_list {
 	size_t 	nsp_name_len;
 };
 
-#define GDM_IMG_XML		0x0100
-#define GDM_IMG_DEVCERT		0x0101
-#define GDM_IMG_SRVROOTCA	0x0102
-#define GDM_IMG_DEVROOTCA	0x0103
-#define GDM_IMG_DEVSUBCA	0x0104
-#define GDM_IMG_EAPPARAM	0x0105
-#define GDM_IMG_SRVCAS		0x0106
+#define GDM_IMG_XML				0x0100
+#define GDM_IMG_DEVCERT			0x0101
+#define GDM_IMG_SRVROOTCA		0x0102
+#define GDM_IMG_DEVROOTCA		0x0103
+#define GDM_IMG_DEVSUBCA		0x0104
+#define GDM_IMG_EAPPARAM		0x0105
+#define GDM_IMG_SRVCAS			0x0106
+
+#define GDM_IMG_EAPPARAM_ONAI		0x01 	/* Outer NAI */
+#define GDM_IMG_EAPPARAM_PKAYPASS	0x02	/* Private Key Password */
+#define GDM_IMG_EAPPARAM_INAI		0x03	/* Inner NAI */
+#define GDM_IMG_EAPPARAM_INAIPASS	0x04	/* Inner NAI Password */
 
 struct gdm_ul_image {
 	u8 	*buf;
@@ -56,7 +80,12 @@ struct wpa_driver_gdm_data {
 	size_t	ss_list_len;
 	
 	struct	gdm_ul_image img_buf[7]; /* number of GDM_IMG_* */
-	struct	wpa_config_blob *blobs;
+//	struct	wpa_config_blob *blobs;
+	
+	PKCS12 *p12;
+	EVP_PKEY *pkey;
+	X509 *cert;
+	STACK_OF(X509) *ca;
 	
 	u8	bssid[ETH_ALEN];
 	u8	ssid[32];
@@ -91,11 +120,11 @@ static void wpa_driver_gdm_ioctl_send_status(struct wpa_driver_gdm_data *drv, in
 static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock_ctx);
 
 /*
- * Blob can consist from more then one certificate/key data,
- * this function return pointer to the next certificate/key in blob data,
+ * Data can consist from more then one certificate/key,
+ * this function return pointer to the next certificate/key data,
  * return NULL if not found.
  */ 
-static void *get_blob_data_next(u8 *data, int len)
+static void *get_sortcert_data_next(u8 *data, int len)
 {
 	unsigned char p = data[len - 1];
 	char *ptr;
@@ -112,10 +141,10 @@ static void *get_blob_data_next(u8 *data, int len)
 
 /*
  * Tell the encoding format and type of the certificate/key by examining if
- * there is "CERTIFICATE" or "PRIVATE KEY" in the blob. If not, at least we
+ * there is "CERTIFICATE" or "PRIVATE KEY" in the data. If not, at least we
  * can test if the first byte is '0'.
  */
-static CERT_TYPE get_blob_data_type(u8 *data, int len) //struct wpa_config_blob *blob
+static CERT_TYPE get_sortcert_data_type(u8 *data, int len)
 {
 	CERT_TYPE type = UNKNOWN_CERT_TYPE;
 	unsigned char p = data[len - 1];
@@ -132,65 +161,62 @@ static CERT_TYPE get_blob_data_type(u8 *data, int len) //struct wpa_config_blob 
 	return type;
 }
 
-/*
- * convert_pem2der() provides the converion from PEM format to DER one, since
- * original certificate handling does not accept the PEM format for blob data.
- * Therefore, we need to convert the data to DER format if it is PEM-format.
- */
-static void convert_pem2der(struct wpa_config_blob *blob)
+static void wpa_driver_gdm_sortcert_img(struct wpa_driver_gdm_data *drv, u8 *data, int len, u16 img_type)
 {
 	X509 *cert = NULL;
 	EVP_PKEY *pkey = NULL;
 	BIO *bp = NULL;
-	unsigned char *buf = NULL;
-	int len = 0;
+	STACK_OF(X509_NAME) *sk = drv->ca;
 	CERT_TYPE type;
-	u8 *data = blob->data;
-	u8 blob_data[16384];
-	int blob_data_len = 0;
+	u8 *ptr = data;
 	int size;
-	int	blob_len = blob->len;
-	blob->len = 0;
-	
+
 	do {
-		size = blob_len - (data - blob->data);
+		size = len - (ptr - data);
 		if(size <= 0)
 			goto end;
 		if (size < sizeof(PEM_CERT_KEYWORD)) {
 			goto end;
 		}
-		if (((type = get_blob_data_type(data, size)) != PEM_CERTIFICATE) &&
+		if (((type = get_sortcert_data_type(ptr, size)) != PEM_CERTIFICATE) &&
 			(type != PEM_PRIVATE_KEY)) {
 			goto end;
 		}
 		bp = BIO_new(BIO_s_mem());
 		if (!bp) goto err;
-		if (!BIO_write(bp, data, size)) goto err;
+		if (!BIO_write(bp, ptr, size)) goto err;
 		if (type == PEM_CERTIFICATE) {
 			if ((cert = PEM_read_bio_X509(bp, NULL, NULL, NULL)) != NULL) {
-				len = i2d_X509(cert, &buf);
+				if ( img_type == GDM_IMG_DEVCERT )
+					drv->cert = cert;
+				else 
+				{
+					if (sk == NULL)
+					{
+						sk = sk_X509_NAME_new_null();
+						if (sk == NULL)
+						{
+							wpa_printf(MSG_ERROR, "Error allocate STACK_OF(X509_NAME)");
+							goto err;
+						}
+						drv->ca = sk;
+					}
+					sk_X509_push(sk, cert);
+				}
 			}
 		} else {
 			if ((pkey = PEM_read_bio_PrivateKey(bp, NULL, NULL, NULL)) != NULL) {
-				len = i2d_PrivateKey(pkey, &buf);
+				/* Optional image type checking */
+				if ( img_type == GDM_IMG_DEVCERT ) 
+					drv->pkey = pkey;				
 			}
 		}
 err:
 		if (bp) BIO_free(bp);
-		if (cert) X509_free(cert);
-		if (pkey) EVP_PKEY_free(pkey);
-		if (buf) {
-			os_memcpy(blob_data + blob_data_len, buf, len);
-			os_free(buf);
-			buf = NULL;
-			blob_data_len += len;
-		}
 		
-		data = get_blob_data_next(data, size);
-	} while(data != NULL);
+		ptr = get_sortcert_data_next(ptr, size);
+	} while(ptr != NULL);
 end:
-	os_memcpy(blob->data, blob_data, blob_data_len);
-	blob->len = blob_data_len;	
 	return;
 }
 
@@ -244,7 +270,7 @@ static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data,
 	
 	aes_ctx = aes_decrypt_init(shakey, sizeof(shakey));
 	if (aes_ctx == NULL) {
-		wpa_printf(MSG_DEBUG, "aes_ctx init failed");
+		wpa_printf(MSG_ERROR, "aes_ctx init failed");
 		return -1;
 	}
 	
@@ -335,13 +361,13 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 	
 	if (offset == 0xffffffff && img->buf == NULL)
 	{
-		wpa_printf(MSG_INFO, "Device image %04x is empty", type);
+		wpa_printf(MSG_DEBUG, "Device image %04x is empty", type);
 		eloop_cancel_timeout(wpa_driver_gdm_get_img_timeout, drv, drv->ctx);
 		return;
 	} 
 	else if (offset == 0xffffffff && img->buf)
 	{
-		wpa_printf(MSG_INFO, "Device image %04x size %zu", type, img->len);	
+		wpa_printf(MSG_DEBUG, "Device image %04x size %zu", type, img->len);	
 		eloop_cancel_timeout(wpa_driver_gdm_get_img_timeout, drv, drv->ctx);
 		/* TODO: decrypt, unpack, write to blob & free img buf */
 						
@@ -359,55 +385,7 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 				if (img->len != -1) {
 					img->len = wpa_driver_gdm_uncompress_img(img->buf, img->len);
 					if (img->len != -1) {
-						struct wpa_supplicant * wpa_s = drv->ctx;
-						struct wpa_config_blob * blobs = wpa_s->conf->blobs;
-						struct wpa_config_blob * blob;
-						
-						blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
-						
-						wpa_hexdump(MSG_MSGDUMP, "uncompressed", img->buf, img->len);
-
-						blob->data = img->buf;
-						blob->len = img->len;	
-						
-						/* covert blob from PEM to DER fromat */
-						convert_pem2der(blob);
-						wpa_hexdump(MSG_MSGDUMP, "pem->der", blob->data, blob->len);
-						
-						if (type == GDM_IMG_DEVCERT) 
-						{
-							blob->name = os_strdup("client_cert");
-							while(blobs)
-								blobs = blobs->next;
-							blobs = blob;
-							if(wpa_s->conf->blobs == NULL)
-								wpa_s->conf->blobs = blobs;
-							break;
-						}
-						else {
-							blob->name = os_strdup("ca_cert");
-							/* 
-							 * It's good to check for "blobs->name != NULL" otherwise os_strcmp cause segmentation fault.
-							 * But it's omitted for easy debug because wpa_supplicant also failed to segmentation fault in this case.
-							 */
-							while(blobs && os_strcmp(blob->name, blobs->name)) 
-								blobs = blobs->next;
-							if (blobs)
-							{
-								u8 *blobs_buf;
-								blobs_buf = (u8 *) os_zalloc (blobs->len + blob->len);
-								os_memcpy(blobs_buf, blobs->data, blobs->len);
-								os_memcpy(blobs_buf + blobs->len, blob->data, blob->len);
-								os_free(blobs->data);
-								blobs->data = blobs_buf;
-								blobs->len += blob->len;
-								os_free(blob);
-							} else {
-								blobs = blob;
-								if(wpa_s->conf->blobs == NULL)
-									wpa_s->conf->blobs = blobs;
-							}
-						}
+						wpa_driver_gdm_sortcert_img(drv, img->buf, img->len, type);
 					}
 				}
 				break;
@@ -415,7 +393,161 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 			case GDM_IMG_EAPPARAM:
 			{
 				img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
-				/* TODO: if identity, anonymous identity, password, privatekey password is missed in *.conf then fill it from device memmory */
+				/* TODO: add check for all errors when allocating memmory and generating certs */
+				/* device eap parameters */
+				int i, data_len;
+				u8 		*data = img->buf;
+				u8 		*anonymous_identity = NULL;
+				size_t 	anonymous_identity_len = 0;
+				u8 		*identity = NULL;	
+				size_t 	identity_len = 0;
+				u8 		*password = NULL;
+				size_t 	password_len = 0;
+				u8 		*private_key_passwd = NULL;
+				/* getting access to blobs and eap parameters */
+				struct wpa_supplicant * wpa_s = drv->ctx;
+				struct wpa_config_blob * blobs = wpa_s->conf->blobs;
+				struct wpa_config_blob * blob;
+				/* creating PKCS#12 pack */
+				PKCS12 			*p12 = NULL;
+				char			*p12_pass = NULL;
+				RSA 			*rsa = NULL;
+				EVP_PKEY 		*pkey = drv->pkey;
+				X509			*cert = drv->cert;
+				STACK_OF(X509) 	*ca = drv->ca;
+				X509_NAME 		*certn = NULL;
+				/* Parse eap parameters from device memmory */
+				for(i = 0; i < img->len;)
+				{
+					data_len = (data[i+1] << 8) + data[i+2];
+					char str[data_len + 1];
+					str[data_len] = '\0';
+					memcpy(str, data + i + 3, data_len);
+					// wpa_printf(MSG_DEBUG, "GDM [%s] Device EAPPARAM image %d : %s", __FUNCTION__, data[i], str);
+					switch(data[i])
+					{
+						case GDM_IMG_EAPPARAM_ONAI:
+							anonymous_identity = (u8 *)os_strdup(str);
+							anonymous_identity_len = data_len;
+							break;
+						case GDM_IMG_EAPPARAM_PKAYPASS:
+							private_key_passwd = (u8 *)os_strdup(str);
+							break;
+						case GDM_IMG_EAPPARAM_INAI:
+							identity = (u8 *)os_strdup(str);
+							identity_len = data_len;
+							break;
+						case GDM_IMG_EAPPARAM_INAIPASS:
+							password = (u8 *)os_strdup(str);
+							password_len = data_len;
+							break;
+					}
+					i += 3 + data_len;		
+				}
+				/* If anonymous_identity is not presented in conf file then use device eap parameters */
+				if(!wpa_s->conf->ssid->eap.anonymous_identity)
+				{
+					wpa_printf(MSG_INFO, "Using Device EAP parameters.");
+					wpa_s->conf->ssid->eap.anonymous_identity = (u8 *)os_strdup((char *)anonymous_identity);
+					wpa_s->conf->ssid->eap.anonymous_identity_len = anonymous_identity_len;
+					wpa_s->conf->ssid->eap.identity = (u8 *)os_strdup((char *)identity);
+					wpa_s->conf->ssid->eap.identity_len = identity_len;
+					wpa_s->conf->ssid->eap.password = (u8 *)os_strdup((char *)password);
+					wpa_s->conf->ssid->eap.password_len = password_len;		
+				}
+				
+				if(wpa_s->conf->ssid->eap.private_key && !os_strcmp((char *) wpa_s->conf->ssid->eap.private_key, "blob://device_certs")) 
+				{
+					wpa_printf(MSG_INFO, "Using Device Certificates.");
+					wpa_s->conf->ssid->eap.private_key_passwd = (u8 *)os_strdup((char *)private_key_passwd);
+					p12_pass = (char *)wpa_s->conf->ssid->eap.private_key_passwd;
+				}
+							
+				OpenSSL_add_all_algorithms();
+				
+				/* Generating fake pkey */
+				if(!pkey)
+				{
+					wpa_printf(MSG_INFO, "Generating fake Private Key.");
+					if ((rsa = RSA_generate_key(2048, RSA_F4, NULL, NULL)) == NULL)
+						wpa_printf(MSG_ERROR, "GDM [%s] Error generating RSA key.", __FUNCTION__);	
+					if ((pkey = EVP_PKEY_new()) == NULL)
+						wpa_printf(MSG_ERROR, "GDM [%s] Error creating EVP_PKEY structure.", __FUNCTION__);	
+					if (!EVP_PKEY_assign_RSA(pkey, rsa))
+						wpa_printf(MSG_DEBUG, "GDM [%s] Error assigning RSA to PKEY.", __FUNCTION__);
+				}
+				/* Generating fake cert */	
+				if(!cert)
+				{
+					wpa_printf(MSG_INFO, "Generating fake Device Certificate.");
+					if ((cert = X509_new()) == NULL)
+						wpa_printf(MSG_ERROR, "GDM [%s] Error allocating cert.", __FUNCTION__);	
+					X509_set_version(cert, 2);
+					ASN1_INTEGER_set(X509_get_serialNumber(cert), 0);
+					X509_gmtime_adj(X509_get_notBefore(cert), 0);
+					X509_gmtime_adj(X509_get_notAfter(cert),
+											  (long)60 * 60 * 24 * 365);
+					if (!pkey || !X509_set_pubkey(cert, pkey))
+						wpa_printf(MSG_ERROR, "GDM [%s] Error setting public key.", __FUNCTION__);
+								
+					certn = X509_get_subject_name(cert);
+					X509_NAME_add_entry_by_txt(certn,
+											  "C", MBSTRING_ASC, (u8 *) "UA", -1, -1, 0);
+					X509_NAME_add_entry_by_txt(certn,
+											  "O", MBSTRING_ASC, (u8 *) "yarx.org.ua", -1, -1, 0);
+					X509_NAME_add_entry_by_txt(certn,
+											  "CN", MBSTRING_ASC, (u8 *) "Yaroslav Levandovskiy", -1, -1, 0);		
+									 
+					X509_set_issuer_name(cert, certn);
+					if (!X509_sign(cert, pkey, EVP_md5()))
+						wpa_printf(MSG_ERROR, "GDM [%s] Error signing cert.", __FUNCTION__);
+				}	
+
+				/* Generating PKCS#12 certificate */	
+				BIO *bio_err = BIO_new_fp (stderr, BIO_NOCLOSE);			
+				p12 = PKCS12_create( p12_pass, "device", pkey, cert, ca,
+										0, 0, 0, 0, 0);
+					 
+				if (!p12)
+				{
+					wpa_printf(MSG_ERROR, "Failed generating a valid PKCS12 certificate.");
+					ERR_print_errors (bio_err);
+				}
+				else 
+				{
+					u8 *buf = NULL;
+					blob = (struct wpa_config_blob *) os_zalloc (sizeof(struct wpa_config_blob));
+					if(!blob)
+						wpa_printf(MSG_ERROR, "GDM [%s] Error allocating memmory for blob.", __FUNCTION__);
+					int buf_len = 0;
+					if((buf_len = i2d_PKCS12(p12, &buf)) <= 0)
+						wpa_printf(MSG_ERROR, "GDM [%s] Error converting PKCS12 certificate.", __FUNCTION__);
+					if (buf) 
+					{
+						blob->name = os_strdup("device_certs");
+						blob->data = (u8 *) os_zalloc (buf_len);
+						os_memcpy(blob->data, buf, buf_len);
+						os_free(buf);
+						blob->len = buf_len;
+						wpa_printf(MSG_DEBUG, "GDM [%s] Creating blob name %s len %lu", __FUNCTION__, blob->name, blob->len);
+						if(!blobs) 
+							wpa_s->conf->blobs = blob;
+						else
+						{
+							while(blobs->next) 
+							{
+								wpa_printf(MSG_DEBUG, "GDM [%s] Exist blob name %s len %lu", __FUNCTION__, blobs->name, blobs->len);
+								blobs = blobs->next;
+							}
+							blobs->next = blob;
+						}
+					}
+				}
+				
+				if (rsa) RSA_free(rsa);
+				if (p12) PKCS12_free(p12);
+				//EVP_cleanup();
+				
 				break;
 			}
 		}
@@ -584,7 +716,7 @@ static void wpa_driver_gdm_scanresp(struct wpa_driver_gdm_data *drv,
 	wpa_printf(MSG_DEBUG, "GDM [%s] len = %d", __FUNCTION__, len);
 
 	if (drv->num_scanres >= MAX_SCAN_RESULTS) {
-		wpa_printf(MSG_DEBUG, "GDM [%s]: No room for the new scan "
+		wpa_printf(MSG_ERROR, "GDM [%s]: No room for the new scan "
 			   "result", __FUNCTION__);
 		return;
 	}	
@@ -718,6 +850,7 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 								}
 								os_memcpy(list->nsp_name, &msg->data[i+2], msg->data[i+1]);
 								list->nsp_name_len = msg->data[i+1];
+								wpa_printf(MSG_INFO, "Home Network SSID \"%s\"", list->nsp_name);
 							}
 							break;
 						}
@@ -805,7 +938,7 @@ static void wpa_driver_gdm_netlink_receive(int sock, void *eloop_ctx, void *sock
 				break;
 			}
 			default:
-				wpa_printf(MSG_INFO, "unused type %04x len %04x", be_to_host16(msg->type), be_to_host16(msg->length)); 
+				wpa_printf(MSG_DEBUG, "unused type %04x len %04x", be_to_host16(msg->type), be_to_host16(msg->length)); 
 		}
 		
 		left -= NLMSG_ALIGN(len);
@@ -841,7 +974,7 @@ static void * wpa_driver_gdm_init(void *ctx, const char *ifname)
 	struct sockaddr_nl local;
 	int idx;
 	
-	wpa_printf(MSG_INFO, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
+	wpa_printf(MSG_DEBUG, "GDM [%s]: ifname(%s)", __FUNCTION__ , ifname);
 
 	drv = os_zalloc(sizeof(*drv));
 	if (drv == NULL)
@@ -924,6 +1057,10 @@ static void wpa_driver_gdm_deinit(void *priv)
 	
 	if (drv->ioctl_sock >= 0)
 		close(drv->ioctl_sock);
+		
+	if (drv->cert) X509_free(drv->cert);
+	if (drv->pkey) EVP_PKEY_free(drv->pkey);	
+	
 	os_free(drv);
 }
 

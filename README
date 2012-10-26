@@ -1,3 +1,0 @@
-Driver wrapper based on wpa_supplicant 0.7.3
-
-sudo ./wpa_supplicant -Dgdm -iwm0 -cwimax.conf -dd
