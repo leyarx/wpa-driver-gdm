@@ -285,6 +285,11 @@ static int wpa_driver_gdm_decrypt_img(struct wpa_driver_gdm_data *drv, u8 *data,
 	int dec_len;
 	dec_data = (struct gdm_decimghdr *) data;
 	dec_len = be_to_host32(dec_data->len);
+	if(dec_len > len) {
+		wpa_printf(MSG_ERROR, "Error: decrypt length (%d) > image length (%d)", dec_len, len);		
+		return -1;	
+	}
+		
 	os_memmove(data, dec_data->data, dec_len);
 	
 	/* TODO: add check for return value */
@@ -393,6 +398,8 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 			case GDM_IMG_EAPPARAM:
 			{
 				img->len = wpa_driver_gdm_decrypt_img(drv, img->buf, img->len);
+				if (img->len == -1)
+					break;
 				/* TODO: add check for all errors when allocating memmory and generating certs */
 				/* device eap parameters */
 				int i, data_len;
@@ -551,9 +558,9 @@ static void wpa_driver_gdm_get_img_result(struct wpa_driver_gdm_data *drv,
 				break;
 			}
 		}
-		//os_free(img->buf);
-		//img->buf = NULL;
-		//img->len = 0;
+		os_free(img->buf);
+		img->buf = NULL;
+		img->len = 0;
 		return;		
 	}
 	else if (!offset && img->buf == NULL && len > sizeof(struct gdm_imghdr))
@@ -711,7 +718,7 @@ static void wpa_driver_gdm_scanresp(struct wpa_driver_gdm_data *drv,
 						const unsigned char *data,
 						int len)
 {
-	struct wpa_scan_res *res;
+	struct wpa_scan_res *res = NULL;
 	
 	wpa_printf(MSG_DEBUG, "GDM [%s] len = %d", __FUNCTION__, len);
 
